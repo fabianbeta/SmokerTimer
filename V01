@@ -265,3 +265,79 @@ if __name__ == "__main__":
         print(f"Critical error: {e}")
         # In case of critical error, reset the system
         machine.reset()
+
+
+################## SAVES CONFIG TO FLASH MEMORY ######################
+
+
+import json
+import os
+
+def save_config(config):
+    try:
+        with open('config.json', 'w') as f:
+            json.dump(config, f)
+        return True
+    except:
+        return False
+
+def load_config():
+    try:
+        # Check if config file exists
+        if 'config.json' in os.listdir():
+            with open('config.json', 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    # Return default config if loading fails
+    return {
+        'default_off_time': 1000,
+        'default_pulse_width': 50,
+        'temp_threshold': 70
+    }
+
+
+################## MAX TEMPO CUTOFF #######################
+
+def read_temperature():
+    sensor_temp = machine.ADC(4)
+    conversion_factor = 3.3 / (65535)
+    reading = sensor_temp.read_u16() * conversion_factor
+    
+    # Temperature calculation formula for Pico
+    temperature = 27 - (reading - 0.706) / 0.001721
+    return temperature
+
+def check_temperature(temp_threshold=85):
+    temp = read_temperature()
+    return temp, temp > temp_threshold
+
+###################  LOGGING   ######################
+
+def log_event(message, level="INFO"):
+    timestamp = utime.localtime()
+    time_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*timestamp[0:6])
+    log_entry = f"{time_str} [{level}] {message}"
+    
+    try:
+        # Append to log file, create if doesn't exist
+        with open('log.txt', 'a') as f:
+            f.write(log_entry + '\n')
+    except:
+        # If writing fails, print to console at least
+        print("Logging failed:", log_entry)
+
+def get_logs(max_lines=50):
+    try:
+        if 'log.txt' not in os.listdir():
+            return ["No logs found"]
+            
+        logs = []
+        with open('log.txt', 'r') as f:
+            for line in f:
+                logs.append(line.strip())
+                if len(logs) > max_lines:
+                    logs.pop(0)  # Keep only the most recent logs
+        return logs
+    except:
+        return ["Error reading logs"]
