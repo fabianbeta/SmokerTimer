@@ -312,9 +312,40 @@ def check_temperature(temp_threshold=85):
     temp = read_temperature()
     return temp, temp > temp_threshold
 
+
 ###################  LOGGING   ######################
 
+import utime
+import os
+
+def log_pulse(pulse_width_ms):
+    """
+    Log each pulse with timestamp and the interpreted pulse width in milliseconds.
+    This data is used to track experiments with different pulse widths.
+    
+    Args:
+        pulse_width_ms (float): The interpreted pulse width in milliseconds
+    """
+    timestamp = utime.localtime()
+    time_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*timestamp[0:6])
+    log_entry = f"{time_str}, PWM: {int(pulse_width_ms)}ms"
+    
+    try:
+        # Append to log file, create if doesn't exist
+        with open('pulse_log.txt', 'a') as f:
+            f.write(log_entry + '\n')
+    except Exception as e:
+        # If writing fails, print to console at least
+        print(f"Pulse logging failed: {log_entry}, error: {e}")
+
 def log_event(message, level="INFO"):
+    """
+    Log general system events with timestamp and log level.
+    
+    Args:
+        message (str): The message to log
+        level (str): Log level (INFO, WARNING, ERROR, etc.)
+    """
     timestamp = utime.localtime()
     time_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*timestamp[0:6])
     log_entry = f"{time_str} [{level}] {message}"
@@ -323,21 +354,33 @@ def log_event(message, level="INFO"):
         # Append to log file, create if doesn't exist
         with open('log.txt', 'a') as f:
             f.write(log_entry + '\n')
-    except:
+    except Exception as e:
         # If writing fails, print to console at least
-        print("Logging failed:", log_entry)
+        print(f"Logging failed: {log_entry}, error: {e}")
 
-def get_logs(max_lines=50):
+def get_logs(max_lines=50, log_type="system"):
+    """
+    Retrieve the most recent logs from the system.
+    
+    Args:
+        max_lines (int): Maximum number of log lines to return
+        log_type (str): "system" for general logs, "pulse" for pulse width logs
+    
+    Returns:
+        list: The most recent log entries
+    """
+    filename = 'pulse_log.txt' if log_type == "pulse" else 'log.txt'
+    
     try:
-        if 'log.txt' not in os.listdir():
-            return ["No logs found"]
+        if filename not in os.listdir():
+            return [f"No {log_type} logs found"]
             
         logs = []
-        with open('log.txt', 'r') as f:
+        with open(filename, 'r') as f:
             for line in f:
                 logs.append(line.strip())
                 if len(logs) > max_lines:
                     logs.pop(0)  # Keep only the most recent logs
         return logs
-    except:
-        return ["Error reading logs"]
+    except Exception as e:
+        return [f"Error reading {log_type} logs: {e}"]
