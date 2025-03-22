@@ -1,0 +1,457 @@
+"""
+Raspberry Pi Pico PWM Controller
+-------------------------------
+This program controls a smoke machine using two potentiometers:
+- Pot 1 (GPIO 26/ADC0): Controls off-time between pulses (0-5000ms)
+- Pot 2 (GPIO 27/ADC1): Controls pulse width (30-200ms)
+- GPIO 16: Output pin to trigger smoke machine
+- GPIO 15: Latching switch input (pulses start when ON, stop when OFF)
+
+LED Status Indicators (Onboard RGB LED):
+- Startup: Green LED blinks 5 times
+- System ready but not pulsing: Solid green LED when switch is OFF
+- Normal: Blue LED when system is active but output is OFF
+- Pulse: Red LED when output pulse is ON
+
+Author: Claude
+Date: March 22, 2025
+"""
+
+import machine
+import utime
+import gc
+from machine import Pin, ADC, PWM
+import random
+
+# ======================= CONFIGURATION CONSTANTS =======================
+# Pin Assignments
+POT_OFF_TIME_PIN = 26      # GPIO 26 (ADC0) for off-time control
+POT_PULSE_WIDTH_PIN = 27   # GPIO 27 (ADC1) for pulse width control
+OUTPUT_PIN = 16            # GPIO 16 for smoke machine trigger
+SWITCH_PIN = 15            # GPIO 15 for latching switch
+
+# LED Pins (Onboard RGB LED)
+# Note: These were previously using pin 15 which now conflicts with the switch
+# Updated to use the correct pins for Pico's onboard RGB LED
+LED_RED = machine.Pin(0, machine.Pin.OUT)   # Changed from 15 to 0
+LED_GREEN = machine.Pin(1, machine.Pin.OUT) # Changed from 14 to 1
+LED_BLUE = machine.Pin(2, machine.Pin.OUT)  # Changed from 13 to 2
+
+# Time Constants (in milliseconds)
+MIN_OFF_TIME = 0
+MAX_OFF_TIME = 5000
+MIN_PULSE_WIDTH = 30
+MAX_PULSE_WIDTH = 200
+DEFAULT_OFF_TIME = 1000
+DEFAULT_PULSE_WIDTH = 100
+
+# ADC Sampling
+NUM_SAMPLES = 15
+SAMPLE_INTERVAL = 5  # 5ms between samples (75ms total)
+
+# Debounce Settings
+DEBOUNCE_THRESHOLD = 50  # ADC value change threshold for debounce
+SWITCH_DEBOUNCE_TIME = 50  # Switch debounce time in ms
+
+# Watchdog timeout (in milliseconds)
+# Set to MAX_OFF_TIME + MAX_PULSE_WIDTH + 3000ms safety margin
+WATCHDOG_TIMEOUT = MAX_OFF_TIME + MAX_PULSE_WIDTH + 3000
+
+# Memory Management
+GC_INTERVAL = 45 * 60 * 1000  # 45 minutes in milliseconds
+
+# ======================= GLOBAL VARIABLES =======================
+# These are necessary to maintain state between loop iterations
+# - last_off_time/last_pulse_width store previous ADC readings for debounce
+#   and provide fallback values if readings fail
+# - last_gc_time tracks when garbage collection was last run
+last_off_time = None  # Set to None initially to force first reading acceptance
+last_pulse_width = None  # Set to None initially to force first reading acceptance
+last_gc_time = 0
+last_switch_time = 0  # Time of last switch state change for debounce
+
+# ======================= HELPER FUNCTIONS =======================
+def set_led(red=False, green=False, blue=False):
+    """
+    Set the onboard RGB LED state.
+    Note: The Pico's LED is active LOW, so we invert the logic.
+    """
+    LED_RED.value(not red)
+    LED_GREEN.value(not green)
+    LED_BLUE.value(not blue)
+
+def all_leds_off():
+    """Turn off all LEDs."""
+    set_led(False, False, False)
+
+def startup_sequence():
+    """
+    Perform the startup sequence:
+    Green LED blinks 5 times (100ms on, 200ms apart)
+    """
+    print("Starting up...")
+    for _ in range(5):
+        set_led(green=True)
+        utime.sleep_ms(100)
+        all_leds_off()
+        utime.sleep_ms(100)
+    print("Startup sequence complete")
+
+def read_potentiometer(adc, prev_value):
+    """
+    Read a potentiometer value with sampling and debouncing.
+    
+    Debouncing prevents small fluctuations in readings from causing timing changes.
+    Only when a reading changes by more than DEBOUNCE_THRESHOLD is it accepted as
+    a genuine change rather than noise or jitter.
+    
+    Args:
+        adc: ADC object for the potentiometer
+        prev_value: Previous valid reading for debouncing (possibly None on first read)
+        
+    Returns:
+        int: Processed potentiometer value
+    """
+    try:
+        # Take multiple samples
+        samples = []
+        for _ in range(NUM_SAMPLES):
+            samples.append(adc.read_u16())
+            utime.sleep_ms(SAMPLE_INTERVAL)
+        
+        # Sort samples and remove outliers (take middle 80%)
+        samples.sort()
+        start_idx = int(NUM_SAMPLES * 0.1)
+        end_idx = int(NUM_SAMPLES * 0.9)
+        filtered_samples = samples[start_idx:end_idx]
+        
+        # Calculate the average
+        avg_value = sum(filtered_samples) // len(filtered_samples)
+        
+        # Apply debounce logic - this is what stabilizes readings
+        # Only accept new readings if they differ significantly from previous value
+        if prev_value is None or abs(avg_value - prev_value) > DEBOUNCE_THRESHOLD:
+            return avg_value
+        else:
+            return prev_value
+            
+    except Exception as e:
+        print(f"Error reading potentiometer: {e}")
+        # Return previous value if there's an error
+        if prev_value is not None:
+            return prev_value
+        else:
+            # If no previous valid value, return defaults that map to middle of ranges
+            # This maps to DEFAULT_OFF_TIME and DEFAULT_PULSE_WIDTH instead of arbitrary midpoint
+            return 32768  # Middle value of u16
+
+def read_switch(switch_pin, debounce_time_ms=SWITCH_DEBOUNCE_TIME):
+    """
+    Read the latching switch with debounce.
+    
+    Args:
+        switch_pin: Pin object for the switch
+        debounce_time_ms: Debounce time in milliseconds
+        
+    Returns:
+        bool: True if switch is ON (GPIO LOW), False if OFF (GPIO HIGH)
+    """
+    global last_switch_time
+    
+    current_time = utime.ticks_ms()
+    if utime.ticks_diff(current_time, last_switch_time) < debounce_time_ms:
+        # Within debounce period, ignore readings
+        return not switch_pin.value()
+    
+    # Outside debounce period, update last switch time and return current state
+    last_switch_time = current_time
+    
+    # Switch is ON when GPIO reads LOW (due to pull-up configuration)
+    return not switch_pin.value()
+
+def map_value(value, in_min, in_max, out_min, out_max):
+    """
+    Map a value from one range to another.
+    
+    Args:
+        value: The input value to map
+        in_min, in_max: The range of the input
+        out_min, out_max: The range of the output
+        
+    Returns:
+        int: The mapped value
+    """
+    # First constrain value to the input range
+    value = max(in_min, min(value, in_max))
+    # Then map to output range
+    return int((value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
+
+def check_memory():
+    """
+    Run garbage collection if it's time.
+    Handles ticks rollover correctly using ticks_diff.
+    """
+    global last_gc_time
+    current_time = utime.ticks_ms()
+    
+    # ticks_diff handles rollover correctly
+    if utime.ticks_diff(current_time, last_gc_time) >= GC_INTERVAL:
+        print("Running garbage collection...")
+        gc.collect()
+        free_mem = gc.mem_free()
+        print(f"Free memory: {free_mem} bytes")
+        last_gc_time = current_time
+
+def error_indicator():
+    """
+    Continuously blink blue LED to indicate error state.
+    100ms on, 500ms apart
+    """
+    while True:
+        set_led(blue=True)
+        utime.sleep_ms(100)
+        all_leds_off()
+        utime.sleep_ms(500)
+
+# ======================= MAIN PROGRAM =======================
+def main():
+    global last_off_time, last_pulse_width
+    
+    print("Initializing PWM controller...")
+    
+    # Initialize ADC for potentiometers
+    pot_off_time = ADC(POT_OFF_TIME_PIN)
+    pot_pulse_width = ADC(POT_PULSE_WIDTH_PIN)
+    
+    # Initialize switch with pull-up resistor
+    switch = Pin(SWITCH_PIN, Pin.IN, Pin.PULL_UP)
+    
+    # Take initial readings to calibrate the range
+    # This helps account for potentiometers that don't use the full ADC range
+    print("Calibrating potentiometers...")
+    # Read a few times to stabilize
+    for _ in range(5):
+        _ = pot_off_time.read_u16()
+        _ = pot_pulse_width.read_u16()
+        utime.sleep_ms(10)
+    
+    # Initialize output pin
+    output = Pin(OUTPUT_PIN, Pin.OUT)
+    output.value(0)  # Ensure output is off initially
+    
+    # Initialize watchdog timer
+    wdt = machine.WDT(timeout=WATCHDOG_TIMEOUT)
+    
+    # Run startup sequence
+    startup_sequence()
+    
+    # Log system startup
+    log_event("System initialized", "INFO")
+    
+    print("Starting main loop...")
+    while True:
+        try:
+            # Feed the watchdog
+            wdt.feed()
+            
+            # Read potentiometer values
+            off_time_raw = read_potentiometer(pot_off_time, last_off_time)
+            pulse_width_raw = read_potentiometer(pot_pulse_width, last_pulse_width)
+            
+            # Map values to desired ranges
+            off_time = map_value(off_time_raw, 0, 65535, MIN_OFF_TIME, MAX_OFF_TIME)
+            pulse_width = map_value(pulse_width_raw, 0, 65535, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH)
+            
+            # Validate the values
+            if off_time < MIN_OFF_TIME or off_time > MAX_OFF_TIME:
+                print(f"Warning: Invalid off_time: {off_time}, using default")
+                log_event(f"Invalid off_time: {off_time}", "WARNING")
+                off_time = DEFAULT_OFF_TIME
+                
+            if pulse_width < MIN_PULSE_WIDTH or pulse_width > MAX_PULSE_WIDTH:
+                print(f"Warning: Invalid pulse_width: {pulse_width}, using default")
+                log_event(f"Invalid pulse_width: {pulse_width}", "WARNING")
+                pulse_width = DEFAULT_PULSE_WIDTH
+            
+            # Update last valid values
+            last_off_time = off_time_raw
+            last_pulse_width = pulse_width_raw
+            
+            # Read switch state
+            switch_on = read_switch(switch)
+            
+            # Debug output
+            print(f"Off time: {off_time}ms, Pulse width: {pulse_width}ms, Switch: {'ON' if switch_on else 'OFF'}")
+            
+            # Check if switch is OFF
+            if not switch_on:
+                # System ready but not pulsing - show solid green LED
+                set_led(green=True)
+                utime.sleep_ms(100)  # Short sleep to prevent tight loop
+                continue  # Skip pulse generation
+            
+            # Off time (Blue LED)
+            set_led(blue=True)
+            utime.sleep_ms(off_time)
+            
+            # Check switch again before starting pulse
+            # This allows for more responsive switch detection during long off-times
+            if not read_switch(switch):
+                continue  # Skip pulse if switch turned off during off-time
+            
+            # Pulse time (Red LED)
+            set_led(red=True)
+            output.value(1)  # Turn on output
+            utime.sleep_ms(pulse_width)
+            output.value(0)  # Turn off output
+            
+            # Log each pulse for monitoring
+            log_pulse(pulse_width)
+            
+            # Check memory periodically
+            check_memory()
+            
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            log_event(f"Error in main loop: {e}", "ERROR")
+            
+            # Use default values if there's an error
+            off_time = DEFAULT_OFF_TIME
+            pulse_width = DEFAULT_PULSE_WIDTH
+            
+            # Blink all LEDs to indicate error
+            for _ in range(3):
+                set_led(red=True, green=True, blue=True)
+                utime.sleep_ms(100)
+                all_leds_off()
+                utime.sleep_ms(100)
+
+            # Check if error is related to potentiometer readings
+            if "potentiometer" in str(e).lower():
+                # If pot readings are invalid, stop output and continuously blink blue LED
+                error_indicator()  # This function doesn't return
+
+# ======================= ADDITIONAL FUNCTIONS =======================
+
+def read_temperature():
+    sensor_temp = machine.ADC(4)
+    conversion_factor = 3.3 / (65535)
+    reading = sensor_temp.read_u16() * conversion_factor
+    
+    # Temperature calculation formula for Pico
+    temperature = 27 - (reading - 0.706) / 0.001721
+    return temperature
+
+def check_temperature(temp_threshold=85):
+    temp = read_temperature()
+    return temp, temp > temp_threshold
+
+# ======================= CONFIGURATION MANAGEMENT =======================
+
+import json
+import os
+
+def save_config(config):
+    try:
+        with open('config.json', 'w') as f:
+            json.dump(config, f)
+        return True
+    except:
+        return False
+
+def load_config():
+    try:
+        # Check if config file exists
+        if 'config.json' in os.listdir():
+            with open('config.json', 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    # Return default config if loading fails
+    return {
+        'default_off_time': 1000,
+        'default_pulse_width': 50,
+        'temp_threshold': 70
+    }
+
+# ======================= LOGGING =======================
+
+import utime
+import os
+
+def log_pulse(pulse_width_ms):
+    """
+    Log each pulse with timestamp and the interpreted pulse width in milliseconds.
+    This data is used to track experiments with different pulse widths.
+    
+    Args:
+        pulse_width_ms (float): The interpreted pulse width in milliseconds
+    """
+    timestamp = utime.localtime()
+    time_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*timestamp[0:6])
+    log_entry = f"{time_str}, PWM: {int(pulse_width_ms)}ms"
+    
+    try:
+        # Append to log file, create if doesn't exist
+        with open('pulse_log.txt', 'a') as f:
+            f.write(log_entry + '\n')
+    except Exception as e:
+        # If writing fails, print to console at least
+        print(f"Pulse logging failed: {log_entry}, error: {e}")
+
+def log_event(message, level="INFO"):
+    """
+    Log general system events with timestamp and log level.
+    
+    Args:
+        message (str): The message to log
+        level (str): Log level (INFO, WARNING, ERROR, etc.)
+    """
+    timestamp = utime.localtime()
+    time_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(*timestamp[0:6])
+    log_entry = f"{time_str} [{level}] {message}"
+    
+    try:
+        # Append to log file, create if doesn't exist
+        with open('log.txt', 'a') as f:
+            f.write(log_entry + '\n')
+    except Exception as e:
+        # If writing fails, print to console at least
+        print(f"Logging failed: {log_entry}, error: {e}")
+
+def get_logs(max_lines=50, log_type="system"):
+    """
+    Retrieve the most recent logs from the system.
+    
+    Args:
+        max_lines (int): Maximum number of log lines to return
+        log_type (str): "system" for general logs, "pulse" for pulse width logs
+    
+    Returns:
+        list: The most recent log entries
+    """
+    filename = 'pulse_log.txt' if log_type == "pulse" else 'log.txt'
+    
+    try:
+        if filename not in os.listdir():
+            return [f"No {log_type} logs found"]
+            
+        logs = []
+        with open(filename, 'r') as f:
+            for line in f:
+                logs.append(line.strip())
+                if len(logs) > max_lines:
+                    logs.pop(0)  # Keep only the most recent logs
+        return logs
+    except Exception as e:
+        return [f"Error reading {log_type} logs: {e}"]
+
+if __name__ == "__main__":
+    # Set up global error handling
+    try:
+        main()
+    except Exception as e:
+        print(f"Critical error: {e}")
+        log_event(f"Critical error: {e}", "CRITICAL")
+        # In case of critical error, reset the system
+        machine.reset()
