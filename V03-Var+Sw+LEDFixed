@@ -9,12 +9,12 @@ import machine
 import utime
 import gc
 from machine import Pin, PWM, ADC, Timer
-import time
 import _thread
 import micropython
+import sys
 
 # Enable emergency exception buffer for debugging
-micropython.alloc_emergency_exception_buf(100)
+micropython.alloc_emergency_exception_buf(200)  # Increased buffer size
 
 #==============================================================================
 # CONFIGURATION CONSTANTS
@@ -44,6 +44,7 @@ GC_INTERVAL = 45 * 60 * 1000 # Garbage collection interval (45 minutes in ms)
 WATCHDOG_TIMEOUT = 8000     # Watchdog timeout (ms)
 SWITCH_DEBOUNCE_TIME = 50   # Switch debounce time (ms)
 WATCHDOG_FEED_INTERVAL = 100 # How often to feed the watchdog during long sleeps (ms)
+ERROR_BLINK_COUNT = 3       # Number of blinks in error sequence
 
 # LED Brightness Levels
 LED_MIN_BRIGHTNESS = 10     # Minimum LED brightness (percentage)
@@ -52,6 +53,8 @@ LED_FULL_BRIGHTNESS = 100   # Full LED brightness (percentage)
 
 # ADC Configuration
 ADC_MAX = 65535             # Maximum ADC value (16-bit)
+ADC_MIN_VALID = 100         # Minimum valid ADC reading
+ADC_MAX_VALID = 65435       # Maximum valid ADC reading
 
 # System States
 STATE_STARTUP = 0
@@ -73,10 +76,15 @@ led_brightness = 0
 pulse_active = False
 thread_running = True
 led_lock = _thread.allocate_lock()  # Mutex for LED access
+state_lock = _thread.allocate_lock()  # Mutex for state variables
 
 # Switch debounce variables
 last_switch_time = 0
 last_switch_state = 1  # Default to off (pulled up)
+last_switch_reading = 1  # Track last raw reading for better debounce
+
+# Global timer reference for proper cleanup
+gc_timer = None
 
 #==============================================================================
 # HARDWARE INITIALIZATION
@@ -112,15 +120,30 @@ def set_led_brightness(brightness_percent):
 
 def map_value(value, in_min, in_max, out_min, out_max):
     """Map a value from one range to another"""
+    # Handle edge cases to prevent division by zero
+    if in_min == in_max:
+        return out_min
+    if value <= in_min:
+        return out_min
+    if value >= in_max:
+        return out_max
+    
     return (value - in_min) * (out_max - out_min) // (in_max - in_min) + out_min
 
 def read_potentiometer(pot, adc_samples=ADC_SAMPLE_COUNT):
-    """Read potentiometer with averaging for stability"""
-    total = 0
+    """Read potentiometer with averaging and filtering for stability"""
+    readings = []
+    
+    # Collect multiple readings
     for _ in range(adc_samples):
-        total += pot.read_u16()
+        readings.append(pot.read_u16())
         utime.sleep_ms(ADC_SAMPLE_INTERVAL)
-    return total // adc_samples
+    
+    # Always filter outliers for better stability
+    readings.sort()
+    # Remove highest and lowest values
+    filtered_readings = readings[1:-1]
+    return sum(filtered_readings) // len(filtered_readings)
 
 def check_potentiometer_readings():
     """Check if potentiometer readings are valid"""
@@ -128,15 +151,20 @@ def check_potentiometer_readings():
         off_reading = read_potentiometer(pot_off_time)
         pulse_reading = read_potentiometer(pot_pulse_width)
         
-        # Check if readings are in expected range (some reasonable bounds)
-        if 0 <= off_reading <= ADC_MAX and 0 <= pulse_reading <= ADC_MAX:
+        # Check if readings are in expected range with stricter bounds
+        if (ADC_MIN_VALID <= off_reading <= ADC_MAX_VALID and 
+            ADC_MIN_VALID <= pulse_reading <= ADC_MAX_VALID):
             return True
+        
+        print(f"Invalid potentiometer readings: off={off_reading}, pulse={pulse_reading}")
         return False
-    except:
+    except Exception as e:
+        print(f"Exception in check_potentiometer_readings: {type(e).__name__}: {e}")
+        sys.print_exception(e)
         return False
 
 def update_timing_values():
-    """Update timing values based on potentiometer readings"""
+    """Update timing values based on potentiometer readings with error handling"""
     global pulse_width, off_time, last_valid_pulse_width, last_valid_off_time, error_condition
     
     try:
@@ -144,44 +172,72 @@ def update_timing_values():
         off_reading = read_potentiometer(pot_off_time)
         pulse_reading = read_potentiometer(pot_pulse_width)
         
-        # Map readings to timing values
+        # Validate readings are in reasonable range
+        if not (ADC_MIN_VALID <= off_reading <= ADC_MAX_VALID and 
+                ADC_MIN_VALID <= pulse_reading <= ADC_MAX_VALID):
+            print(f"Reading out of range: off={off_reading}, pulse={pulse_reading}")
+            error_condition = True
+            return False
+            
+        # Map readings to timing values with bounds checking
         new_off_time = map_value(off_reading, 0, ADC_MAX, MIN_OFF_TIME, MAX_OFF_TIME)
         new_pulse_width = map_value(pulse_reading, 0, ADC_MAX, MIN_PULSE_WIDTH, MAX_PULSE_WIDTH)
         
-        # Update values
-        pulse_width = new_pulse_width
-        off_time = new_off_time
+        # Sanity check on mapped values
+        if not (MIN_OFF_TIME <= new_off_time <= MAX_OFF_TIME and 
+                MIN_PULSE_WIDTH <= new_pulse_width <= MAX_PULSE_WIDTH):
+            print(f"Mapped values out of range: off={new_off_time}, pulse={new_pulse_width}")
+            error_condition = True
+            return False
         
-        # Store as last valid readings
-        last_valid_pulse_width = pulse_width
-        last_valid_off_time = off_time
-        
-        error_condition = False
+        # Update values - use state_lock for thread safety
+        with state_lock:
+            pulse_width = new_pulse_width
+            off_time = new_off_time
+            
+            # Store as last valid readings
+            last_valid_pulse_width = pulse_width
+            last_valid_off_time = off_time
+            error_condition = False
+            
         return True
     except Exception as e:
-        # If error, use last valid values
-        pulse_width = last_valid_pulse_width
-        off_time = last_valid_off_time
-        error_condition = True
+        # If error, use last valid values and log
+        print(f"Exception in update_timing_values: {type(e).__name__}: {e}")
+        sys.print_exception(e)
+        
+        with state_lock:
+            pulse_width = last_valid_pulse_width
+            off_time = last_valid_off_time
+            error_condition = True
+            
         return False
 
 def read_switch_debounced():
-    """Read switch value with debounce"""
-    global last_switch_time, last_switch_state
+    """Read switch value with improved debounce logic"""
+    global last_switch_time, last_switch_state, last_switch_reading
     
     current_time = utime.ticks_ms()
-    current_state = switch.value()
+    current_reading = switch.value()
     
-    # If enough time has passed since the last change, update the state
+    # Check if enough time has passed since the last state change
     if utime.ticks_diff(current_time, last_switch_time) > SWITCH_DEBOUNCE_TIME:
-        if current_state != last_switch_state:
-            last_switch_time = current_time
-            last_switch_state = current_state
+        # Only update if the reading has been stable
+        if current_reading == last_switch_reading:
+            # State is different from last stable state
+            if current_reading != last_switch_state:
+                last_switch_state = current_reading
+                last_switch_time = current_time
+        
+        # Always update the last reading
+        last_switch_reading = current_reading
     
     return last_switch_state
 
 def sleep_with_watchdog(sleep_time_ms):
     """Sleep for the specified time while feeding the watchdog periodically"""
+    global current_state, pulse_active
+    
     start_time = utime.ticks_ms()
     while utime.ticks_diff(utime.ticks_ms(), start_time) < sleep_time_ms:
         # Sleep in smaller chunks
@@ -195,6 +251,17 @@ def sleep_with_watchdog(sleep_time_ms):
         
         # Check for switch state changes during long sleeps
         check_switch_change()
+        
+        # Exit early if global state changed - use state_lock for thread safety
+        with state_lock:
+            current_state_local = current_state
+            pulse_active_local = pulse_active
+            
+        if (current_state_local != STATE_RUNNING and 
+            current_state_local != STATE_PULSING and 
+            pulse_active_local):
+            # If we were pulsing but are no longer, break out
+            return
 
 def check_switch_change():
     """Check switch state and handle state transitions if necessary"""
@@ -202,23 +269,33 @@ def check_switch_change():
     
     switch_val = read_switch_debounced()
     
-    if switch_val == 0:  # Switch is ON (LOW due to pull-up)
-        if current_state != STATE_ERROR and current_state != STATE_PULSING and current_state != STATE_RUNNING:
-            current_state = STATE_RUNNING
-    else:  # Switch is OFF
-        if current_state == STATE_RUNNING or current_state == STATE_PULSING:
-            current_state = STATE_READY
+    # Use state_lock for thread safety during state transitions
+    with state_lock:
+        if switch_val == 0:  # Switch is ON (LOW due to pull-up)
+            if (current_state != STATE_ERROR and 
+                current_state != STATE_PULSING and 
+                current_state != STATE_RUNNING):
+                current_state = STATE_RUNNING
+        else:  # Switch is OFF
+            if current_state == STATE_RUNNING or current_state == STATE_PULSING:
+                # Ensure output is off when switching off
+                output.value(0)
+                current_state = STATE_READY
 
 #==============================================================================
 # LED STATUS INDICATOR FUNCTIONS
 #==============================================================================
 def startup_sequence():
     """Run LED startup sequence"""
-    for _ in range(STARTUP_BLINK_COUNT):
+    for i in range(STARTUP_BLINK_COUNT):
         set_led_brightness(LED_FULL_BRIGHTNESS)
         utime.sleep_ms(STARTUP_BLINK_ON)
         set_led_brightness(0)
-        utime.sleep_ms(STARTUP_BLINK_INTERVAL)
+        
+        # Last blink doesn't need to wait after turning off
+        if i < STARTUP_BLINK_COUNT - 1:
+            utime.sleep_ms(STARTUP_BLINK_INTERVAL - STARTUP_BLINK_ON)
+            
         wdt.feed()  # Feed watchdog during startup
 
 def pulse_led_thread():
@@ -228,35 +305,69 @@ def pulse_led_thread():
     while thread_running:
         wdt.feed()  # Feed watchdog timer
         
-        if current_state == STATE_READY or current_state == STATE_RUNNING:
+        # Use state_lock for thread safety
+        with state_lock:
+            current_state_local = current_state
+            pulse_active_local = pulse_active
+        
+        if current_state_local == STATE_READY or current_state_local == STATE_RUNNING:
             # Only update LED if not in active pulse
-            if not pulse_active:
-                # Pulsing effect between min and max brightness
-                for brightness in range(LED_MIN_BRIGHTNESS, LED_MAX_BRIGHTNESS + 1):
-                    if current_state != STATE_READY and current_state != STATE_RUNNING:
+            if not pulse_active_local:
+                # Calculate steps for smooth transition
+                steps = 50  # More steps for smoother gradient
+                step_time = PULSE_CYCLE // (2 * steps)  # Time per step (up and down)
+                
+                # Pulsing effect between min and max brightness (upward)
+                for i in range(steps):
+                    # Re-check state before each step for responsiveness
+                    with state_lock:
+                        current_state_local = current_state
+                        pulse_active_local = pulse_active
+                        
+                    if (current_state_local != STATE_READY and 
+                        current_state_local != STATE_RUNNING):
                         break
-                    if not pulse_active:  # Check again to avoid race condition
-                        set_led_brightness(brightness)
-                        led_brightness = brightness
-                    utime.sleep_ms(PULSE_CYCLE // (LED_MAX_BRIGHTNESS - LED_MIN_BRIGHTNESS) // 2)
-                    wdt.feed()
+                    if pulse_active_local:  # Skip if pulse becomes active
+                        break
                     
-                for brightness in range(LED_MAX_BRIGHTNESS, LED_MIN_BRIGHTNESS - 1, -1):
-                    if current_state != STATE_READY and current_state != STATE_RUNNING:
+                    # Calculate brightness for this step
+                    brightness = LED_MIN_BRIGHTNESS + (LED_MAX_BRIGHTNESS - LED_MIN_BRIGHTNESS) * i // steps
+                    set_led_brightness(brightness)
+                    led_brightness = brightness
+                    utime.sleep_ms(step_time)
+                    wdt.feed()
+                
+                # Pulsing effect between max and min brightness (downward)
+                for i in range(steps):
+                    # Re-check state before each step for responsiveness
+                    with state_lock:
+                        current_state_local = current_state
+                        pulse_active_local = pulse_active
+                        
+                    if (current_state_local != STATE_READY and 
+                        current_state_local != STATE_RUNNING):
                         break
-                    if not pulse_active:  # Check again to avoid race condition
-                        set_led_brightness(brightness)
-                        led_brightness = brightness
-                    utime.sleep_ms(PULSE_CYCLE // (LED_MAX_BRIGHTNESS - LED_MIN_BRIGHTNESS) // 2)
+                    if pulse_active_local:  # Skip if pulse becomes active
+                        break
+                    
+                    # Calculate brightness for this step
+                    brightness = LED_MAX_BRIGHTNESS - (LED_MAX_BRIGHTNESS - LED_MIN_BRIGHTNESS) * i // steps
+                    set_led_brightness(brightness)
+                    led_brightness = brightness
+                    utime.sleep_ms(step_time)
                     wdt.feed()
             else:
                 # Just wait while pulse is active
-                utime.sleep_ms(100)
+                utime.sleep_ms(50)
                 
-        elif current_state == STATE_ERROR:
+        elif current_state_local == STATE_ERROR:
             # Error blinking pattern
-            for _ in range(3):  # Blink 3 times
-                if current_state != STATE_ERROR:
+            for _ in range(ERROR_BLINK_COUNT):  # Blink specified number of times
+                # Re-check state for responsiveness
+                with state_lock:
+                    current_state_local = current_state
+                    
+                if current_state_local != STATE_ERROR:
                     break
                 set_led_brightness(LED_FULL_BRIGHTNESS)
                 utime.sleep_ms(ERROR_BLINK_ON)
@@ -265,17 +376,33 @@ def pulse_led_thread():
                 wdt.feed()
             
             # Pause
-            if current_state == STATE_ERROR:
-                set_led_brightness(0)
-                sleep_with_watchdog(ERROR_PAUSE)
+            with state_lock:
+                current_state_local = current_state
                 
-        elif current_state == STATE_PULSING:
+            if current_state_local == STATE_ERROR:
+                set_led_brightness(0)
+                
+                # Use sleep_with_watchdog for long pauses
+                start_time = utime.ticks_ms()
+                while True:
+                    # Re-check state for responsiveness
+                    with state_lock:
+                        current_state_local = current_state
+                        
+                    if (current_state_local != STATE_ERROR or 
+                        utime.ticks_diff(utime.ticks_ms(), start_time) >= ERROR_PAUSE):
+                        break
+                        
+                    utime.sleep_ms(WATCHDOG_FEED_INTERVAL)
+                    wdt.feed()
+                
+        elif current_state_local == STATE_PULSING:
             # During pulse, LED is handled in the main loop
-            utime.sleep_ms(100)  # Just wait a bit
+            utime.sleep_ms(50)  # Just wait a bit
             
         else:
             # Default behavior - just wait
-            utime.sleep_ms(100)
+            utime.sleep_ms(50)
 
 #==============================================================================
 # MEMORY MANAGEMENT
@@ -283,57 +410,80 @@ def pulse_led_thread():
 def gc_collection_task(timer):
     """Run garbage collection periodically"""
     gc.collect()
-    print("GC run, free memory:", gc.mem_free())
+    print(f"GC run, free memory: {gc.mem_free()} bytes")
+    
+    # Feed watchdog during GC for safety
+    wdt.feed()
 
 #==============================================================================
 # MAIN PROGRAM
 #==============================================================================
 def main():
-    global current_state, error_condition, pulse_active, thread_running
+    global current_state, error_condition, pulse_active, thread_running, gc_timer
+    
+    print("Starting Raspberry Pi Pico PWM Controller for Smoke Machine")
     
     # Set up garbage collection timer
     gc_timer = Timer()
     gc_timer.init(period=GC_INTERVAL, mode=Timer.PERIODIC, callback=gc_collection_task)
     
     # Run startup sequence
-    current_state = STATE_STARTUP
+    with state_lock:
+        current_state = STATE_STARTUP
+    print("Running startup sequence")
     startup_sequence()
     
     # Verify potentiometer readings
+    print("Checking potentiometer readings")
     if not check_potentiometer_readings():
-        current_state = STATE_ERROR
+        with state_lock:
+            current_state = STATE_ERROR
         print("Error: Invalid potentiometer readings at startup")
     else:
         print("Potentiometer readings valid, continuing to normal operation")
-        current_state = STATE_READY
+        # Update timing values based on current pot positions
+        update_timing_values()
+        print(f"Initial settings - Pulse width: {pulse_width}ms, Off time: {off_time}ms")
+        with state_lock:
+            current_state = STATE_READY
     
     # Start LED control in a separate thread
+    print("Starting LED control thread")
     _thread.start_new_thread(pulse_led_thread, ())
     
     # Enter main loop
+    print("Entering main loop")
     try:
         while True:
             # Feed the watchdog
             wdt.feed()
             
-            # Check for errors from potentiometer readings
+            # Periodically check potentiometer readings
             if not update_timing_values():
-                if current_state != STATE_ERROR:
-                    print("Error: Potentiometer reading failure")
-                    current_state = STATE_ERROR
-            elif current_state == STATE_ERROR and not error_condition:
-                # Recover from error state if readings are valid
-                print("Recovered from error state")
-                current_state = STATE_READY
+                with state_lock:
+                    if current_state != STATE_ERROR:
+                        print("Error: Potentiometer reading failure")
+                        current_state = STATE_ERROR
+            elif error_condition == False:
+                with state_lock:
+                    if current_state == STATE_ERROR:
+                        # Recover from error state if readings are valid
+                        print("Recovered from error state")
+                        current_state = STATE_READY
             
             # Check switch state (with debounce)
             check_switch_change()
             
+            # Get current state safely
+            with state_lock:
+                current_state_local = current_state
+            
             # Execute state behavior
-            if current_state == STATE_RUNNING:
+            if current_state_local == STATE_RUNNING:
                 # Transition to pulsing state
-                current_state = STATE_PULSING
-                pulse_active = True
+                with state_lock:
+                    current_state = STATE_PULSING
+                    pulse_active = True
                 
                 # Acquire LED lock before changing LED state
                 with led_lock:
@@ -353,29 +503,40 @@ def main():
                 # Check switch state again before off time
                 check_switch_change()
                 
+                # Get updated state safely
+                with state_lock:
+                    current_state_local = current_state
+                
                 # If still in pulsing state and switch is still on, continue with off time
-                if current_state == STATE_PULSING:
+                if current_state_local == STATE_PULSING:
                     # Wait for off time with watchdog feeds
                     sleep_with_watchdog(off_time)
                     
-                    # Release pulse_active flag
-                    pulse_active = False
+                    # Release pulse_active flag with thread safety
+                    with state_lock:
+                        pulse_active = False
                     
                     # Check switch state one more time
                     check_switch_change()
                     
+                    # Get updated state safely
+                    with state_lock:
+                        current_state_local = current_state
+                    
                     # If switch is still on, go back to running state
-                    if current_state == STATE_PULSING:
-                        current_state = STATE_RUNNING
+                    if current_state_local == STATE_PULSING:
+                        with state_lock:
+                            current_state = STATE_RUNNING
                 else:
                     # If state changed during pulse or off time, ensure pulse_active is reset
-                    pulse_active = False
+                    with state_lock:
+                        pulse_active = False
                 
-            elif current_state == STATE_READY:
+            elif current_state_local == STATE_READY:
                 # Ready state - LED pulsing is handled in the thread
                 utime.sleep_ms(100)
                 
-            elif current_state == STATE_ERROR:
+            elif current_state_local == STATE_ERROR:
                 # Error state - LED blinking is handled in the thread
                 output.value(0)  # Ensure output is off
                 utime.sleep_ms(100)
@@ -386,18 +547,28 @@ def main():
     
     except KeyboardInterrupt:
         # Clean shutdown for development purposes
-        thread_running = False
+        with state_lock:
+            thread_running = False
         print("Program interrupted by user")
         
     except Exception as e:
         # In case of unhandled exception, try to safely shut down
-        thread_running = False
-        print("Unhandled exception:", e)
+        with state_lock:
+            thread_running = False
+        print("Unhandled exception:", type(e).__name__, e)
+        sys.print_exception(e)  # More detailed error trace
+        micropython.mem_info()  # Print memory info for debugging
         
     finally:
         # Safe shutdown
         output.value(0)  # Ensure output is off
-        thread_running = False  # Signal thread to exit
+        with state_lock:
+            thread_running = False  # Signal thread to exit
+        
+        # Properly cleanup timer resource
+        if gc_timer:
+            gc_timer.deinit()
+            
         utime.sleep_ms(200)  # Give thread time to exit
         
         # Signal shutdown with rapidly blinking LED
@@ -406,6 +577,8 @@ def main():
             utime.sleep_ms(50)
             led.duty_u16(0)
             utime.sleep_ms(50)
+        
+        print("Controller shutdown complete")
 
 if __name__ == "__main__":
     main()
