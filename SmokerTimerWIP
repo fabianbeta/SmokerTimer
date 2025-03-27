@@ -1,0 +1,104 @@
+import machine
+import utime
+import math
+
+# Pin Definitions
+LED_PIN = 25        # Onboard LED
+SWITCH_PIN = 15     # Switch input
+POT_ON_TIME_PIN = 26  # ADC0 - On-time potentiometer
+POT_OFF_TIME_PIN = 27  # ADC1 - Off-time potentiometer
+
+# Timing Limits
+MIN_ON_TIME = 30       # Minimum on time (ms)
+MAX_ON_TIME = 200      # Maximum on time (ms)
+MIN_OFF_TIME = 0       # Minimum off time (ms)
+MAX_OFF_TIME = 5000    # Maximum off time (ms)
+
+# ADC Configuration
+ADC_MAX = 65535        # Maximum ADC value (16-bit)
+ADC_MIN_VALID = 100    # Minimum valid ADC reading
+ADC_MAX_VALID = 65435  # Maximum valid ADC reading
+
+# Log Aggression Parameter
+LOG_AGGRESSION = 1.5   # Adjust this value to fine-tune log curve intensity
+
+# Initialize pins
+led = machine.Pin(LED_PIN, machine.Pin.OUT)
+switch = machine.Pin(SWITCH_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+pot_on_time = machine.ADC(POT_ON_TIME_PIN)
+pot_off_time = machine.ADC(POT_OFF_TIME_PIN)
+
+# Debounce variables
+last_switch_state = 1
+last_switch_time = 0
+DEBOUNCE_DELAY = 20  # Reduced debounce time for better responsiveness
+
+def map_value(value, in_min, in_max, out_min, out_max):
+    """Map a value from one range to another"""
+    if in_min == in_max:
+        return out_min
+    if value <= in_min:
+        return out_min
+    if value >= in_max:
+        return out_max
+    
+    return (value - in_min) * (out_max - out_min) // (in_max - in_min) + out_min
+
+def log_map_value(value, in_min, in_max, out_min, out_max):
+    """Logarithmic mapping with configurable aggression"""
+    if value <= in_min:
+        return out_min
+    if value >= in_max:
+        return out_max
+    
+    log_min = math.log10(out_min + 1)
+    log_max = math.log10(out_max + 1)
+    scale = (log_max - log_min) * LOG_AGGRESSION / (in_max - in_min)
+    mapped_value = int(math.pow(10, (value - in_min) * scale + log_min) - 1)
+    
+    return min(max(mapped_value, out_min), out_max)  # Clamp to valid range
+
+def read_potentiometer(pot, samples=15):
+    """Read potentiometer with averaging"""
+    readings = [pot.read_u16() for _ in range(samples)]
+    readings.sort()
+    filtered_readings = readings[1:-1]  # Remove first and last (potential outliers)
+    return sum(filtered_readings) // len(filtered_readings)
+
+def read_switch_debounced():
+    global last_switch_state, last_switch_time
+    
+    current_time = utime.ticks_ms()
+    current_reading = switch.value()
+    
+    if utime.ticks_diff(current_time, last_switch_time) > DEBOUNCE_DELAY:
+        if current_reading != last_switch_state:
+            last_switch_state = current_reading
+            last_switch_time = current_time
+    
+    return last_switch_state
+
+def main():
+    while True:
+        switch_state = read_switch_debounced()
+        
+        if switch_state == 0:
+            on_reading = read_potentiometer(pot_on_time)
+            off_reading = read_potentiometer(pot_off_time)
+            
+            on_time = map_value(on_reading, 0, ADC_MAX, MIN_ON_TIME, MAX_ON_TIME)
+            off_time = log_map_value(off_reading, 0, ADC_MAX, MIN_OFF_TIME, MAX_OFF_TIME)
+            
+            print(f"On Time: {on_time} ms, Off Time: {off_time} ms")  # Debug log
+            
+            led.value(1)
+            utime.sleep_ms(on_time)
+            
+            led.value(0)
+            utime.sleep_ms(off_time)
+        else:
+            led.value(0)
+            utime.sleep_ms(10)  # Reduced idle delay for better responsiveness
+
+if __name__ == "__main__":
+    main()
